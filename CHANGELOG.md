@@ -9,6 +9,10 @@
 
 - Force interactive prompts to use `/dev/tty` when available (more robust on some terminals)
 
+## 0.1.5 (2026-01-05)
+
+- Fix `cx-add` interactive prompts on some terminals by using `read -p` (no `/dev/tty` dependency)
+
 ## 0.1.2 (2026-01-05)
 
 - Improve interactive prompts on some terminals (readline + bracketed-paste stripping)

@@ -24,19 +24,6 @@ term_printf() {
   printf "$@" >&"$fd"
 }
 
-tty_can_use() {
-  [[ -t 0 ]] || return 1
-  [[ -r /dev/tty && -w /dev/tty ]] || return 1
-  return 0
-}
-
-tty_printf() {
-  # Always write prompts to the controlling terminal when available so they don't disappear
-  # when stdout/stderr are redirected or wrapped by terminal integrations.
-  # shellcheck disable=SC2059
-  printf "$@" >/dev/tty
-}
-
 usage() {
   cat <<'EOF'
 codex-switch - switch Codex multi-account configs (config.toml + auth.json)
@@ -72,23 +59,22 @@ prompt() {
   local msg="$1"
   local default="${2:-}"
   local input
-  if tty_can_use; then
-    if [[ -n "$default" ]]; then
-      tty_printf "%s [%s]: " "$msg" "$default"
-    else
-      tty_printf "%s: " "$msg"
-    fi
-    bracketed_paste_off
-    IFS= read -r -e input </dev/tty
-    bracketed_paste_on
+  local prompt_str
+  if [[ -n "$default" ]]; then
+    prompt_str="$msg [$default]: "
   else
-    if [[ -n "$default" ]]; then
-      term_printf "%s [%s]: " "$msg" "$default"
-    else
-      term_printf "%s: " "$msg"
-    fi
+    prompt_str="$msg: "
+  fi
+
+  bracketed_paste_off
+  if [[ -t 0 ]]; then
+    # Use bash readline for arrow-key editing.
+    IFS= read -r -e -p "$prompt_str" input
+  else
+    term_printf "%s" "$prompt_str"
     IFS= read -r input
   fi
+  bracketed_paste_on
 
   input="$(sanitize_terminal_input "$input")"
   if [[ -z "$input" ]]; then
@@ -101,17 +87,16 @@ prompt() {
 prompt_secret() {
   local msg="$1"
   local input
-  if tty_can_use; then
-    tty_printf "%s: " "$msg"
-    bracketed_paste_off
-    IFS= read -r -s input </dev/tty
-    bracketed_paste_on
-    tty_printf "\n"
+  bracketed_paste_off
+  if [[ -t 0 ]]; then
+    IFS= read -r -s -p "$msg: " input
+    term_printf "\n"
   else
     term_printf "%s: " "$msg"
     IFS= read -r -s input
     term_printf "\n"
   fi
+  bracketed_paste_on
   echo "$(sanitize_terminal_input "$input")"
 }
 
@@ -128,11 +113,6 @@ sanitize_terminal_input() {
 }
 
 bracketed_paste_off() {
-  if tty_can_use; then
-    printf '\e[?2004l' >/dev/tty || true
-    return 0
-  fi
-
   local fd
   fd="$(term_fd)"
   [[ -t "$fd" ]] || return 0
@@ -140,11 +120,6 @@ bracketed_paste_off() {
 }
 
 bracketed_paste_on() {
-  if tty_can_use; then
-    printf '\e[?2004h' >/dev/tty || true
-    return 0
-  fi
-
   local fd
   fd="$(term_fd)"
   [[ -t "$fd" ]] || return 0
@@ -776,11 +751,7 @@ EOF
     if [[ "$yes" == "yes" ]]; then
       auth_mode="copy"
     else
-      if tty_can_use; then
-        tty_printf "auth: paste API key (input hidden). Press Enter to copy current auth.json.\n"
-      else
-        term_printf "auth: paste API key (input hidden). Press Enter to copy current auth.json.\n"
-      fi
+      term_printf "auth: paste API key (input hidden). Press Enter to copy current auth.json.\n"
       local api_key
       api_key="$(prompt_secret "auth")"
       if [[ -z "$api_key" ]]; then
