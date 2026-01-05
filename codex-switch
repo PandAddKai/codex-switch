@@ -24,28 +24,7 @@ term_printf() {
   printf "$@" >&"$fd"
 }
 
-TTY_FD=""
-
-tty_open() {
-  if [[ -n "${TTY_FD:-}" ]]; then
-    return 0
-  fi
-  if exec {TTY_FD}<>/dev/tty 2>/dev/null; then
-    return 0
-  fi
-  TTY_FD=""
-  return 1
-}
-
-tty_available() {
-  tty_open
-}
-
-tty_write() {
-  tty_open || return 1
-  # shellcheck disable=SC2059
-  printf "$@" >&"$TTY_FD"
-}
+# (no /dev/tty dependency; prompts use stderr/stdout and input is sanitized)
 
 usage() {
   cat <<'EOF'
@@ -81,7 +60,7 @@ have_cmd() {
 prompt() {
   local msg="$1"
   local default="${2:-}"
-  local input
+  local input=""
   local prompt_str
   if [[ -n "$default" ]]; then
     prompt_str="$msg [$default]: "
@@ -89,17 +68,15 @@ prompt() {
     prompt_str="$msg: "
   fi
 
-  bracketed_paste_off
-  if tty_available; then
-    tty_write "%s" "$prompt_str" || true
-    if ! IFS= read -r input <&"$TTY_FD"; then
-      die "input aborted"
+  term_printf "%s" "$prompt_str"
+  if [[ -t 0 ]]; then
+    # Try readline editing (arrow keys). If unavailable, fall back to plain read.
+    if ! IFS= read -r -e input; then
+      IFS= read -r input || die "input aborted"
     fi
   else
-    term_printf "%s" "$prompt_str"
     IFS= read -r input || die "input aborted"
   fi
-  bracketed_paste_on
 
   input="$(sanitize_terminal_input "$input")"
   if [[ -z "$input" ]]; then
@@ -111,20 +88,16 @@ prompt() {
 
 prompt_secret() {
   local msg="$1"
-  local input
-  bracketed_paste_off
-  if tty_available; then
-    tty_write "%s: " "$msg" || true
-    if ! IFS= read -r -s input <&"$TTY_FD"; then
-      die "input aborted"
-    fi
-    tty_write "\n" || true
-  else
-    term_printf "%s: " "$msg"
+  local input=""
+
+  term_printf "%s: " "$msg"
+  if [[ -t 0 ]]; then
     IFS= read -r -s input || die "input aborted"
-    term_printf "\n"
+  else
+    IFS= read -r -s input || die "input aborted"
   fi
-  bracketed_paste_on
+  term_printf "\n"
+
   echo "$(sanitize_terminal_input "$input")"
 }
 
@@ -140,27 +113,8 @@ sanitize_terminal_input() {
   echo "$value"
 }
 
-bracketed_paste_off() {
-  local fd
-  fd="$(term_fd)"
-  if tty_available; then
-    printf '\e[?2004l' >&"$TTY_FD" || true
-    return 0
-  fi
-  [[ -t "$fd" ]] || return 0
-  printf '\e[?2004l' >&"$fd" || true
-}
-
-bracketed_paste_on() {
-  local fd
-  fd="$(term_fd)"
-  if tty_available; then
-    printf '\e[?2004h' >&"$TTY_FD" || true
-    return 0
-  fi
-  [[ -t "$fd" ]] || return 0
-  printf '\e[?2004h' >&"$fd" || true
-}
+# NOTE: we intentionally do not toggle bracketed-paste mode.
+# Some terminals/wrappers handle it poorly; we instead strip the markers from input.
 
 toml_get_string() {
   local file="$1"
