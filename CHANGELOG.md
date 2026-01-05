@@ -25,6 +25,10 @@
 
 - Rework interactive prompts to avoid `/dev/tty` and bracketed-paste toggling; sanitize pasted input instead (fix AlmaLinux "blank prompt" cases)
 
+## 0.1.9 (2026-01-05)
+
+- Fix `cx-add` auth generation when config has `[features]` boolean flags (only update root-level `model_provider`)
+
 ## 0.1.2 (2026-01-05)
 
 - Improve interactive prompts on some terminals (readline + bracketed-paste stripping)

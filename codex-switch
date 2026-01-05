@@ -383,13 +383,21 @@ set_toml_key() {
   local value="$3"
   local tmp
   tmp="$(mktemp)"
+
+  # Update a *root-level* key only (before the first table header). This avoids accidentally
+  # changing similarly-named keys under other tables like [features], which may expect booleans.
   awk -v key="$key" -v value="$value" '
-    BEGIN { done=0 }
-    $0 ~ "^" key "[ \t]*=" && !done {
+    BEGIN { done=0; before_tables=1 }
+    before_tables && $0 ~ "^" key "[ \t]*=" && !done {
       print key " = \"" value "\""
       done=1
       next
     }
+    before_tables && $0 ~ /^\[/ && !done {
+      print key " = \"" value "\""
+      done=1
+    }
+    $0 ~ /^\[/ { before_tables=0 }
     { print }
     END {
       if (!done) print key " = \"" value "\""
