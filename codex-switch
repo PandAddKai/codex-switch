@@ -24,6 +24,15 @@ term_printf() {
   printf "$@" >&"$fd"
 }
 
+tty_available() {
+  [[ -r /dev/tty && -w /dev/tty ]]
+}
+
+tty_write() {
+  # shellcheck disable=SC2059
+  printf "$@" >/dev/tty
+}
+
 usage() {
   cat <<'EOF'
 codex-switch - switch Codex multi-account configs (config.toml + auth.json)
@@ -67,12 +76,12 @@ prompt() {
   fi
 
   bracketed_paste_off
-  if [[ -t 0 ]]; then
-    # Use bash readline for arrow-key editing.
-    IFS= read -r -e -p "$prompt_str" input
+  if tty_available; then
+    tty_write "%s" "$prompt_str"
+    IFS= read -r input </dev/tty || die "input aborted"
   else
     term_printf "%s" "$prompt_str"
-    IFS= read -r input
+    IFS= read -r input || die "input aborted"
   fi
   bracketed_paste_on
 
@@ -88,12 +97,13 @@ prompt_secret() {
   local msg="$1"
   local input
   bracketed_paste_off
-  if [[ -t 0 ]]; then
-    IFS= read -r -s -p "$msg: " input
-    term_printf "\n"
+  if tty_available; then
+    tty_write "%s: " "$msg"
+    IFS= read -r -s input </dev/tty || die "input aborted"
+    tty_write "\n"
   else
     term_printf "%s: " "$msg"
-    IFS= read -r -s input
+    IFS= read -r -s input || die "input aborted"
     term_printf "\n"
   fi
   bracketed_paste_on
@@ -115,6 +125,10 @@ sanitize_terminal_input() {
 bracketed_paste_off() {
   local fd
   fd="$(term_fd)"
+  if tty_available; then
+    printf '\e[?2004l' >/dev/tty || true
+    return 0
+  fi
   [[ -t "$fd" ]] || return 0
   printf '\e[?2004l' >&"$fd" || true
 }
@@ -122,6 +136,10 @@ bracketed_paste_off() {
 bracketed_paste_on() {
   local fd
   fd="$(term_fd)"
+  if tty_available; then
+    printf '\e[?2004h' >/dev/tty || true
+    return 0
+  fi
   [[ -t "$fd" ]] || return 0
   printf '\e[?2004h' >&"$fd" || true
 }
