@@ -8,6 +8,22 @@ die() {
   exit 1
 }
 
+term_fd() {
+  # Prefer stderr for prompts if it's a TTY; otherwise fall back to stdout.
+  if [[ -t 2 ]]; then
+    echo 2
+  else
+    echo 1
+  fi
+}
+
+term_printf() {
+  local fd
+  fd="$(term_fd)"
+  # shellcheck disable=SC2059
+  printf "$@" >&"$fd"
+}
+
 usage() {
   cat <<'EOF'
 codex-switch - switch Codex multi-account configs (config.toml + auth.json)
@@ -44,9 +60,9 @@ prompt() {
   local default="${2:-}"
   local input
   if [[ -n "$default" ]]; then
-    printf "%s [%s]: " "$msg" "$default" >&2
+    term_printf "%s [%s]: " "$msg" "$default"
   else
-    printf "%s: " "$msg" >&2
+    term_printf "%s: " "$msg"
   fi
   bracketed_paste_off
   if [[ -t 0 ]]; then
@@ -67,11 +83,11 @@ prompt() {
 prompt_secret() {
   local msg="$1"
   local input
-  printf "%s: " "$msg" >&2
+  term_printf "%s: " "$msg"
   bracketed_paste_off
   IFS= read -r -s input
   bracketed_paste_on
-  printf "\n" >&2
+  term_printf "\n"
   echo "$(sanitize_terminal_input "$input")"
 }
 
@@ -88,13 +104,17 @@ sanitize_terminal_input() {
 }
 
 bracketed_paste_off() {
-  [[ -t 1 ]] || return 0
-  printf '\e[?2004l' >&2 || true
+  local fd
+  fd="$(term_fd)"
+  [[ -t "$fd" ]] || return 0
+  printf '\e[?2004l' >&"$fd" || true
 }
 
 bracketed_paste_on() {
-  [[ -t 1 ]] || return 0
-  printf '\e[?2004h' >&2 || true
+  local fd
+  fd="$(term_fd)"
+  [[ -t "$fd" ]] || return 0
+  printf '\e[?2004h' >&"$fd" || true
 }
 
 toml_get_string() {
@@ -722,6 +742,7 @@ EOF
     if [[ "$yes" == "yes" ]]; then
       auth_mode="copy"
     else
+      term_printf "auth: paste API key (input hidden). Press Enter to copy current auth.json.\n"
       local api_key
       api_key="$(prompt_secret "auth")"
       if [[ -z "$api_key" ]]; then

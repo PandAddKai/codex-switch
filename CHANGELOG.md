@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3 (2026-01-05)
+
+- Fix missing prompts on some terminals by writing prompts to a TTY (stderr or stdout)
+- Make the hidden `auth` input step more explicit
+
 ## 0.1.2 (2026-01-05)
 
 - Improve interactive prompts on some terminals (readline + bracketed-paste stripping)
