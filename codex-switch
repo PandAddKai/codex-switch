@@ -24,13 +24,27 @@ term_printf() {
   printf "$@" >&"$fd"
 }
 
+TTY_FD=""
+
+tty_open() {
+  if [[ -n "${TTY_FD:-}" ]]; then
+    return 0
+  fi
+  if exec {TTY_FD}<>/dev/tty 2>/dev/null; then
+    return 0
+  fi
+  TTY_FD=""
+  return 1
+}
+
 tty_available() {
-  [[ -r /dev/tty && -w /dev/tty ]]
+  tty_open
 }
 
 tty_write() {
+  tty_open || return 1
   # shellcheck disable=SC2059
-  printf "$@" >/dev/tty
+  printf "$@" >&"$TTY_FD"
 }
 
 usage() {
@@ -77,8 +91,10 @@ prompt() {
 
   bracketed_paste_off
   if tty_available; then
-    tty_write "%s" "$prompt_str"
-    IFS= read -r input </dev/tty || die "input aborted"
+    tty_write "%s" "$prompt_str" || true
+    if ! IFS= read -r input <&"$TTY_FD"; then
+      die "input aborted"
+    fi
   else
     term_printf "%s" "$prompt_str"
     IFS= read -r input || die "input aborted"
@@ -98,9 +114,11 @@ prompt_secret() {
   local input
   bracketed_paste_off
   if tty_available; then
-    tty_write "%s: " "$msg"
-    IFS= read -r -s input </dev/tty || die "input aborted"
-    tty_write "\n"
+    tty_write "%s: " "$msg" || true
+    if ! IFS= read -r -s input <&"$TTY_FD"; then
+      die "input aborted"
+    fi
+    tty_write "\n" || true
   else
     term_printf "%s: " "$msg"
     IFS= read -r -s input || die "input aborted"
@@ -126,7 +144,7 @@ bracketed_paste_off() {
   local fd
   fd="$(term_fd)"
   if tty_available; then
-    printf '\e[?2004l' >/dev/tty || true
+    printf '\e[?2004l' >&"$TTY_FD" || true
     return 0
   fi
   [[ -t "$fd" ]] || return 0
@@ -137,7 +155,7 @@ bracketed_paste_on() {
   local fd
   fd="$(term_fd)"
   if tty_available; then
-    printf '\e[?2004h' >/dev/tty || true
+    printf '\e[?2004h' >&"$TTY_FD" || true
     return 0
   fi
   [[ -t "$fd" ]] || return 0

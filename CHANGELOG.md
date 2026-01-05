@@ -17,6 +17,10 @@
 
 - Ensure prompts always work even if stdin isn't a TTY (read input from `/dev/tty` when available)
 
+## 0.1.7 (2026-01-05)
+
+- Open `/dev/tty` once and reuse its fd for prompts (more robust on AlmaLinux)
+
 ## 0.1.2 (2026-01-05)
 
 - Improve interactive prompts on some terminals (readline + bracketed-paste stripping)
