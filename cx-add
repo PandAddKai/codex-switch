@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<'EOF'
+Usage:
+  cx-add <profile>
+
+Interactive shortcut for:
+  codex-switch add <profile>
+
+Tip:
+  - At "auth:" prompt, paste API key (input hidden); press Enter to copy current auth.json
+  - Use --auth-edit to open $EDITOR for auth.json
+EOF
+  exit 0
+fi
+
+exec codex-switch add "$@"

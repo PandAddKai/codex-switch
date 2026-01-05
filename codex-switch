@@ -1,0 +1,983 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROG="codex-switch"
+
+die() {
+  echo "error: $*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+codex-switch - switch Codex multi-account configs (config.toml + auth.json)
+
+Usage:
+  codex-switch init
+  codex-switch list
+  codex-switch current
+  codex-switch add <profile>
+  codex-switch edit <profile>
+  codex-switch del <profile>
+  codex-switch use <profile>
+  codex-switch save <profile>
+  codex-switch rollback
+  codex-switch path
+
+Notes:
+  - Profiles only include: config.toml + auth.json
+  - Default CODEX_HOME: ~/.codex (override by exporting CODEX_HOME)
+  - No secret contents are printed; files are treated as opaque blobs.
+EOF
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+prompt() {
+  local msg="$1"
+  local default="${2:-}"
+  local input
+  if [[ -n "$default" ]]; then
+    printf "%s [%s]: " "$msg" "$default" >&2
+  else
+    printf "%s: " "$msg" >&2
+  fi
+  IFS= read -r input
+  if [[ -z "$input" ]]; then
+    echo "$default"
+  else
+    echo "$input"
+  fi
+}
+
+prompt_secret() {
+  local msg="$1"
+  local input
+  printf "%s: " "$msg" >&2
+  IFS= read -r -s input
+  printf "\n" >&2
+  echo "$input"
+}
+
+toml_get_string() {
+  local file="$1"
+  local key="$2"
+  awk -v key="$key" '
+    {
+      line=$0
+      sub(/^[ \t]*/, "", line)
+      if (line ~ "^" key "[ \t]*=") {
+        if (match(line, /\"([^\"]*)\"/, m)) {
+          print m[1]
+          exit
+        }
+      }
+    }
+  ' "$file" 2>/dev/null || true
+}
+
+codex_native_bin() {
+  if [[ -n "${CODEX_SWITCH_CODEX_BIN:-}" ]]; then
+    echo "$CODEX_SWITCH_CODEX_BIN"
+    return 0
+  fi
+
+  if have_cmd codex && codex --help >/dev/null 2>&1; then
+    echo "codex"
+    return 0
+  fi
+
+  if have_cmd codex; then
+    local real pkgroot candidate
+    real="$(readlink -f "$(command -v codex)" 2>/dev/null || command -v codex)"
+    pkgroot="$(dirname "$(dirname "$real")")"
+    candidate="$pkgroot/vendor/x86_64-unknown-linux-musl/codex/codex"
+    if [[ -x "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  fi
+
+  local fallback
+  fallback="$(ls -1 "$HOME"/.nvm/versions/node/*/lib/node_modules/@openai/codex/vendor/*/codex/codex 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$fallback" && -x "$fallback" ]]; then
+    echo "$fallback"
+    return 0
+  fi
+
+  die "cannot find working codex binary; set CODEX_SWITCH_CODEX_BIN to the native 'codex' executable"
+}
+
+normalize_auth_mode() {
+  local mode="$1"
+  mode="$(echo "$mode" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "$mode" in
+    1|copy) echo "copy" ;;
+    2|from) echo "from" ;;
+    3|paste) echo "paste" ;;
+    4|edit) echo "edit" ;;
+    5|empty) echo "empty" ;;
+    *) echo "$mode" ;;
+  esac
+}
+
+trim_ws() {
+  echo "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+current_base_url() {
+  local cfg mp
+  cfg="$(codex_home)/config.toml"
+  [[ -f "$cfg" ]] || return 0
+
+  mp="$(toml_get_string "$cfg" "model_provider")"
+  [[ -n "$mp" ]] || return 0
+
+  awk -v mp="$mp" '
+    BEGIN { inside=0 }
+    $0=="[model_providers." mp "]" { inside=1; next }
+    inside && /^\[/ { exit }
+    inside && /^base_url[ \t]*=/ { print; exit }
+  ' "$cfg" 2>/dev/null | sed -n 's/^base_url[[:space:]]*=[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' | head -n 1 || true
+}
+
+sha256_file() {
+  local path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$path" | awk '{print $2}'
+  else
+    die "missing hash command: sha256sum/shasum/openssl"
+  fi
+}
+
+fingerprint_dir() {
+  local dir="$1"
+  local cfg="$dir/config.toml"
+  local auth="$dir/auth.json"
+  [[ -f "$cfg" ]] || die "missing $cfg"
+  [[ -f "$auth" ]] || die "missing $auth"
+  printf "%s:%s\n" "$(sha256_file "$cfg")" "$(sha256_file "$auth")"
+}
+
+backup_limit() {
+  local limit="${CODEX_SWITCH_BACKUP_LIMIT:-10}"
+  [[ "$limit" =~ ^[0-9]+$ ]] || die "invalid CODEX_SWITCH_BACKUP_LIMIT (must be integer): $limit"
+  echo "$limit"
+}
+
+prune_backups() {
+  local root limit
+  root="$(backups_dir)"
+  limit="$(backup_limit)"
+  mkdir -p "$root"
+
+  local -a dirs
+  mapfile -t dirs < <(find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
+  local n remove_count i
+  n="${#dirs[@]}"
+  if (( n <= limit )); then
+    return 0
+  fi
+  remove_count=$((n - limit))
+  for ((i = 0; i < remove_count; i++)); do
+    rm -rf -- "$root/${dirs[$i]}"
+  done
+}
+
+validate_profile_name() {
+  local name="$1"
+  [[ -n "$name" ]] || die "profile name required"
+  [[ "$name" != *"/"* ]] || die "invalid profile name (must not contain '/'): $name"
+  [[ "$name" != "." && "$name" != ".." ]] || die "invalid profile name: $name"
+}
+
+codex_home() {
+  if [[ -n "${CODEX_HOME:-}" ]]; then
+    echo "$CODEX_HOME"
+  else
+    echo "$HOME/.codex"
+  fi
+}
+
+switch_root() {
+  echo "${CODEX_SWITCH_HOME:-$HOME/.codex-switch}"
+}
+
+profiles_dir() {
+  echo "$(switch_root)/profiles"
+}
+
+state_dir() {
+  echo "$(switch_root)/state"
+}
+
+backups_dir() {
+  echo "$(switch_root)/backups"
+}
+
+lock_path() {
+  echo "$(switch_root)/.lock"
+}
+
+with_lock() {
+  (
+    local lock_file
+    lock_file="$(lock_path)"
+    mkdir -p "$(dirname "$lock_file")"
+    if command -v flock >/dev/null 2>&1; then
+      exec 9>"$lock_file"
+      flock -x 9
+      "$@"
+    else
+      "$@"
+    fi
+  )
+}
+
+ensure_dirs() {
+  mkdir -p "$(profiles_dir)" "$(state_dir)" "$(backups_dir)"
+}
+
+current_profile_file() {
+  echo "$(state_dir)/current"
+}
+
+read_current_profile() {
+  local f
+  f="$(current_profile_file)"
+  if [[ -r "$f" ]]; then
+    tr -d '\n' <"$f"
+  else
+    echo ""
+  fi
+}
+
+write_current_profile() {
+  local name="$1"
+  ensure_dirs
+  printf "%s\n" "$name" >"$(current_profile_file)"
+}
+
+profile_path() {
+  local name="$1"
+  echo "$(profiles_dir)/$name"
+}
+
+require_profile_exists() {
+  local name="$1"
+  local dir
+  dir="$(profile_path "$name")"
+  [[ -d "$dir" ]] || die "profile not found: $name (expected dir: $dir)"
+  [[ -f "$dir/config.toml" ]] || die "missing $dir/config.toml"
+  [[ -f "$dir/auth.json" ]] || die "missing $dir/auth.json"
+}
+
+require_codex_files_exist() {
+  local ch
+  ch="$(codex_home)"
+  [[ -d "$ch" ]] || die "codex home not found: $ch (set CODEX_HOME to override)"
+  [[ -f "$ch/config.toml" ]] || die "missing $ch/config.toml"
+  [[ -f "$ch/auth.json" ]] || die "missing $ch/auth.json"
+}
+
+profile_is_active() {
+  local name="$1"
+  local ch pdir
+  ch="$(codex_home)"
+  pdir="$(profile_path "$name")"
+  [[ -f "$ch/config.toml" && -f "$ch/auth.json" ]] || return 1
+  [[ -f "$pdir/config.toml" && -f "$pdir/auth.json" ]] || return 1
+  [[ "$(fingerprint_dir "$ch")" == "$(fingerprint_dir "$pdir")" ]]
+}
+
+write_file_atomic() {
+  local dest="$1"
+  local mode="$2"
+  local dest_dir base tmp
+  dest_dir="$(dirname "$dest")"
+  base="$(basename "$dest")"
+  mkdir -p "$dest_dir"
+  tmp="$(mktemp -p "$dest_dir" ".${base}.tmp.XXXXXX")"
+  cat >"$tmp"
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$dest"
+}
+
+set_toml_key() {
+  local file="$1"
+  local key="$2"
+  local value="$3"
+  local tmp
+  tmp="$(mktemp)"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { done=0 }
+    $0 ~ "^" key "[ \t]*=" && !done {
+      print key " = \"" value "\""
+      done=1
+      next
+    }
+    { print }
+    END {
+      if (!done) print key " = \"" value "\""
+    }
+  ' "$file" >"$tmp"
+  cat "$tmp" | write_file_atomic "$file" 600
+  rm -f "$tmp"
+}
+
+ensure_provider_block() {
+  local file="$1"
+  local provider="$2"
+  local base_url="$3"
+  local header="[model_providers.$provider]"
+
+  if grep -qxF "$header" "$file"; then
+    local tmp
+    tmp="$(mktemp)"
+    awk -v header="$header" -v base_url="$base_url" -v provider="$provider" '
+      BEGIN { inside=0; wrote_base=0; wrote_name=0 }
+      $0==header { print; inside=1; next }
+      inside && /^base_url[ \t]*=/ { print "base_url = \"" base_url "\""; wrote_base=1; next }
+      inside && /^name[ \t]*=/ { print "name = \"" provider "\""; wrote_name=1; next }
+      inside && /^\[/ {
+        if (!wrote_name) { print "name = \"" provider "\""; wrote_name=1 }
+        if (!wrote_base) { print "base_url = \"" base_url "\""; wrote_base=1 }
+        inside=0
+      }
+      { print }
+      END {
+        if (inside && !wrote_name) print "name = \"" provider "\""
+        if (inside && !wrote_base) print "base_url = \"" base_url "\""
+      }
+    ' "$file" >"$tmp"
+    cat "$tmp" | write_file_atomic "$file" 600
+    rm -f "$tmp"
+    return 0
+  fi
+
+  cat >>"$file" <<EOF
+
+[model_providers.$provider]
+name = "$provider"
+base_url = "$base_url"
+wire_api = "responses"
+requires_openai_auth = true
+EOF
+  chmod 600 "$file"
+}
+
+toml_table_exists() {
+  local file="$1"
+  local header="$2"
+  grep -qxF "$header" "$file"
+}
+
+toml_delete_table() {
+  local file="$1"
+  local header="$2"
+  local tmp
+  tmp="$(mktemp)"
+  awk -v header="$header" '
+    BEGIN { skip=0 }
+    $0==header { skip=1; next }
+    skip && /^\[/ { skip=0 }
+    !skip { print }
+  ' "$file" >"$tmp"
+  cat "$tmp" | write_file_atomic "$file" 600
+  rm -f "$tmp"
+}
+
+toml_rename_table() {
+  local file="$1"
+  local old_header="$2"
+  local new_header="$3"
+  local provider="$4"
+  local tmp
+  tmp="$(mktemp)"
+  awk -v old_header="$old_header" -v new_header="$new_header" -v provider="$provider" '
+    BEGIN { inside=0 }
+    $0==old_header { print new_header; inside=1; next }
+    inside && /^\[/ { inside=0 }
+    inside && /^name[ \t]*=/ { print "name = \"" provider "\""; next }
+    { print }
+  ' "$file" >"$tmp"
+  cat "$tmp" | write_file_atomic "$file" 600
+  rm -f "$tmp"
+}
+
+normalize_right_provider_table() {
+  local file="$1"
+  local mp
+  mp="$(toml_get_string "$file" "model_provider")"
+  [[ -n "$mp" ]] || return 0
+  [[ "$mp" != "right" ]] || return 0
+
+  local right_header mp_header
+  right_header="[model_providers.right]"
+  mp_header="[model_providers.$mp]"
+
+  if toml_table_exists "$file" "$right_header"; then
+    if toml_table_exists "$file" "$mp_header"; then
+      toml_delete_table "$file" "$right_header"
+    else
+      toml_rename_table "$file" "$right_header" "$mp_header" "$mp"
+    fi
+  fi
+}
+
+copy_atomic() {
+  local src="$1"
+  local dest="$2"
+  local mode="$3"
+  local dest_dir base tmp
+  dest_dir="$(dirname "$dest")"
+  base="$(basename "$dest")"
+  mkdir -p "$dest_dir"
+  tmp="$(mktemp -p "$dest_dir" ".${base}.tmp.XXXXXX")"
+  cp -f "$src" "$tmp"
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$dest"
+}
+
+backup_current() {
+  local label="$1"
+  local ch root ts bdir
+  ch="$(codex_home)"
+  root="$(backups_dir)"
+  ts="$(date +%Y%m%d-%H%M%S)"
+  bdir="$root/$ts-$label"
+  mkdir -p "$bdir"
+
+  if [[ -f "$ch/config.toml" ]]; then
+    copy_atomic "$ch/config.toml" "$bdir/config.toml" 600
+  fi
+  if [[ -f "$ch/auth.json" ]]; then
+    copy_atomic "$ch/auth.json" "$bdir/auth.json" 600
+  fi
+  printf "%s\n" "$bdir" >"$(state_dir)/last_backup"
+  prune_backups
+}
+
+do_init() {
+  ensure_dirs
+  echo "OK: initialized at $(switch_root)"
+}
+
+do_list() {
+  ensure_dirs
+  local d
+  d="$(profiles_dir)"
+  if [[ ! -d "$d" ]]; then
+    exit 0
+  fi
+  (cd "$d" && ls -1) 2>/dev/null || true
+}
+
+do_current() {
+  ensure_dirs
+  local cur
+  cur="$(read_current_profile)"
+
+  if [[ -n "$cur" ]] && profile_is_active "$cur" 2>/dev/null; then
+    echo "$cur"
+    return 0
+  fi
+
+  local p name
+  for p in "$(profiles_dir)"/*; do
+    [[ -d "$p" ]] || continue
+    name="$(basename "$p")"
+    if profile_is_active "$name" 2>/dev/null; then
+      write_current_profile "$name"
+      echo "$name"
+      return 0
+    fi
+  done
+
+  echo "(unknown)"
+}
+
+do_path() {
+  cat <<EOF
+CODEX_HOME=$(codex_home)
+CODEX_SWITCH_HOME=$(switch_root)
+profiles=$(profiles_dir)
+EOF
+}
+
+do_save() {
+  local name="$1"
+  validate_profile_name "$name"
+  ensure_dirs
+  require_codex_files_exist
+
+  local ch pdir
+  ch="$(codex_home)"
+  pdir="$(profile_path "$name")"
+  mkdir -p "$pdir"
+
+  copy_atomic "$ch/config.toml" "$pdir/config.toml" 600
+  copy_atomic "$ch/auth.json" "$pdir/auth.json" 600
+  echo "OK: saved profile '$name' -> $pdir"
+}
+
+do_add() {
+  local name="$1"
+  shift || true
+  validate_profile_name "$name"
+  ensure_dirs
+  require_codex_files_exist
+
+  local provider="" base_url="" auth_mode="" auth_from="" do_switch="no" force="no" yes="no"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider)
+        [[ $# -ge 2 ]] || die "missing value for --provider"
+        provider="$2"; shift 2
+        ;;
+      --base-url)
+        [[ $# -ge 2 ]] || die "missing value for --base-url"
+        base_url="$2"; shift 2
+        ;;
+      --copy-auth)
+        auth_mode="copy"; shift
+        ;;
+      --no-copy-auth)
+        auth_mode="empty"; shift
+        ;;
+      --auth-empty)
+        auth_mode="empty"; shift
+        ;;
+      --auth-copy)
+        auth_mode="copy"; shift
+        ;;
+      --auth-from)
+        [[ $# -ge 2 ]] || die "missing value for --auth-from"
+        auth_mode="from"; auth_from="$2"; shift 2
+        ;;
+      --auth-paste)
+        auth_mode="paste"; shift
+        ;;
+      --auth-edit)
+        auth_mode="edit"; shift
+        ;;
+      --switch)
+        do_switch="yes"; shift
+        ;;
+      --force)
+        force="yes"; shift
+        ;;
+      -y|--yes)
+        yes="yes"; shift
+        ;;
+      -h|--help)
+        cat <<'EOF'
+Usage:
+  codex-switch add <profile> [options]
+
+Options:
+  --provider <name>     Provider name used in config.toml (default: <profile>)
+  --base-url <url>      base_url for the provider (prompt if missing)
+  --auth-copy           Copy current auth.json into profile
+  --auth-from <path>    Copy auth.json from another file
+  --auth-paste          Paste raw auth.json from stdin (finish with Ctrl-D)
+  --auth-edit           Create then open $EDITOR to edit auth.json
+  --auth-empty          Create empty auth.json ("{}")
+  --copy-auth           Alias of --auth-copy
+  --no-copy-auth        Alias of --auth-empty
+  --switch              Switch to the new profile after creating it
+  --force               Overwrite existing profile directory if exists
+  -y, --yes             Accept defaults for prompts
+
+Interactive defaults (no --auth-* given):
+  - Prompts for provider + base_url
+  - Prompts for API key as "auth:" (input hidden). Press Enter to copy current auth.json instead.
+EOF
+        exit 0
+        ;;
+      *)
+        die "unknown option for add: $1"
+        ;;
+    esac
+  done
+
+  local pdir wdir success
+  pdir="$(profile_path "$name")"
+  if [[ -e "$pdir" && "$force" != "yes" ]]; then
+    die "profile already exists: $name (use 'save' or pass --force)"
+  fi
+
+  wdir="$(mktemp -d -p "$(profiles_dir)" ".${name}.tmp.XXXXXX")"
+  success="no"
+  cleanup_add() {
+    if [[ "${success:-no}" != "yes" && -n "${wdir:-}" && -d "${wdir:-}" ]]; then
+      rm -rf -- "$wdir"
+    fi
+  }
+  trap cleanup_add EXIT INT TERM
+
+  local ch
+  ch="$(codex_home)"
+  copy_atomic "$ch/config.toml" "$wdir/config.toml" 600
+
+  local old_provider
+  old_provider="$(toml_get_string "$wdir/config.toml" "model_provider")"
+
+  local default_provider default_base_url input
+  default_provider="$name"
+  if [[ -z "$provider" ]]; then
+    if [[ "$yes" == "yes" ]]; then
+      provider="$default_provider"
+    else
+      printf "Provider name [%s]: " "$default_provider" >&2
+      IFS= read -r input
+      provider="${input:-$default_provider}"
+    fi
+  fi
+  provider="$(trim_ws "$provider")"
+  [[ "$provider" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid provider name: $provider (allowed: [A-Za-z0-9_-]+)"
+
+  default_base_url="$(current_base_url)"
+  if [[ -z "$base_url" ]]; then
+    if [[ "$yes" == "yes" && -n "$default_base_url" ]]; then
+      base_url="$default_base_url"
+    else
+      if [[ -n "$default_base_url" ]]; then
+        printf "base_url [%s]: " "$default_base_url" >&2
+      else
+        printf "base_url: " >&2
+      fi
+      IFS= read -r input
+      base_url="${input:-$default_base_url}"
+    fi
+  fi
+  base_url="$(trim_ws "$base_url")"
+  [[ -n "$base_url" ]] || die "base_url required"
+
+  # If the source config only has [model_providers.right], keep it in sync when switching away.
+  if [[ "$old_provider" == "right" && "$provider" != "right" ]]; then
+    local right_header new_header
+    right_header="[model_providers.right]"
+    new_header="[model_providers.$provider]"
+    if toml_table_exists "$wdir/config.toml" "$right_header"; then
+      if toml_table_exists "$wdir/config.toml" "$new_header"; then
+        toml_delete_table "$wdir/config.toml" "$right_header"
+      else
+        toml_rename_table "$wdir/config.toml" "$right_header" "$new_header" "$provider"
+      fi
+    fi
+  fi
+
+  set_toml_key "$wdir/config.toml" "model_provider" "$provider"
+  ensure_provider_block "$wdir/config.toml" "$provider" "$base_url"
+
+  if [[ -z "$auth_mode" ]]; then
+    if [[ "$yes" == "yes" ]]; then
+      auth_mode="copy"
+    else
+      local api_key
+      api_key="$(prompt_secret "auth")"
+      if [[ -z "$api_key" ]]; then
+        auth_mode="copy"
+      else
+        auth_mode="api_key"
+        auth_from="$api_key"
+      fi
+    fi
+  fi
+  auth_mode="$(normalize_auth_mode "$auth_mode")"
+
+  case "$auth_mode" in
+    copy)
+      copy_atomic "$ch/auth.json" "$wdir/auth.json" 600
+      ;;
+    api_key|apikey|key)
+      local codex_bin
+      codex_bin="$(codex_native_bin)"
+      # Writes auth.json using Codex itself to avoid guessing schema. Reads key from stdin.
+      # Do NOT print the key; keep it in-memory only.
+      printf '%s\n' "$auth_from" | CODEX_HOME="$wdir" "$codex_bin" login --with-api-key >/dev/null
+      chmod 600 "$wdir/auth.json" 2>/dev/null || true
+      ;;
+    empty)
+      printf "%s\n" "{}" | write_file_atomic "$wdir/auth.json" 600
+      ;;
+    from)
+      if [[ -z "$auth_from" ]]; then
+        if [[ "$yes" == "yes" ]]; then
+          die "--auth-from requires a path (or choose another mode)"
+        fi
+        auth_from="$(prompt "Path to auth.json to copy")"
+      fi
+      [[ -f "$auth_from" ]] || die "auth file not found: $auth_from"
+      copy_atomic "$auth_from" "$wdir/auth.json" 600
+      ;;
+    paste)
+      if [[ "$yes" == "yes" ]]; then
+        die "--auth-paste requires stdin input (omit -y for interactive)"
+      fi
+      echo "Paste auth.json content now, then press Ctrl-D to finish:" >&2
+      write_file_atomic "$wdir/auth.json" 600
+      ;;
+    edit)
+      copy_atomic "$ch/auth.json" "$wdir/auth.json" 600
+      local editor
+      editor="${EDITOR:-${VISUAL:-}}"
+      if [[ -z "$editor" ]]; then
+        if have_cmd nano; then editor="nano"
+        elif have_cmd vi; then editor="vi"
+        else die "no editor found; set EDITOR or use another auth mode"
+        fi
+      fi
+      "$editor" "$wdir/auth.json"
+      ;;
+    *)
+      die "invalid auth mode: $auth_mode (expected copy/from/paste/edit/empty)"
+      ;;
+  esac
+
+  if [[ -e "$pdir" && "$force" == "yes" ]]; then
+    rm -rf -- "$pdir"
+  fi
+  mv -f -- "$wdir" "$pdir"
+  success="yes"
+  trap - EXIT INT TERM
+
+  echo "OK: added profile '$name' -> $pdir"
+  if [[ "$do_switch" == "yes" ]]; then
+    do_use "$name"
+  fi
+}
+
+do_del() {
+  local name="$1"
+  shift || true
+  validate_profile_name "$name"
+  ensure_dirs
+
+  local yes="no"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes|--force)
+        yes="yes"; shift
+        ;;
+      -h|--help)
+        cat <<'EOF'
+Usage:
+  codex-switch del <profile> [-y|--yes|--force]
+
+Notes:
+  - Deletes profile directory under ~/.codex-switch/profiles/<profile>
+  - If profile is recorded as current, clears ~/.codex-switch/state/current
+EOF
+        exit 0
+        ;;
+      *)
+        die "unknown option for del: $1"
+        ;;
+    esac
+  done
+
+  local pdir
+  pdir="$(profile_path "$name")"
+  [[ -d "$pdir" ]] || die "profile not found: $name"
+
+  if [[ "$yes" != "yes" ]]; then
+    local ans
+    ans="$(prompt "Delete profile '$name'? Type 'yes' to confirm" "")"
+    [[ "$ans" == "yes" ]] || die "aborted"
+  fi
+
+  rm -rf -- "$pdir"
+
+  if [[ "$(read_current_profile)" == "$name" ]]; then
+    printf "%s\n" "" >"$(current_profile_file)"
+  fi
+
+  echo "OK: deleted profile '$name'"
+}
+
+do_edit() {
+  local name="$1"
+  shift || true
+  validate_profile_name "$name"
+  ensure_dirs
+  require_profile_exists "$name"
+
+  local yes="no"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes)
+        yes="yes"; shift
+        ;;
+      -h|--help)
+        cat <<'EOF'
+Usage:
+  codex-switch edit <profile> [-y]
+
+Notes:
+  - Opens profile config.toml and auth.json in $EDITOR (or nano/vi fallback)
+  - If the profile is current, re-applies it to CODEX_HOME after edit
+EOF
+        exit 0
+        ;;
+      *)
+        die "unknown option for edit: $1"
+        ;;
+    esac
+  done
+
+  local pdir cfg auth editor
+  pdir="$(profile_path "$name")"
+  cfg="$pdir/config.toml"
+  auth="$pdir/auth.json"
+
+  editor="${EDITOR:-${VISUAL:-}}"
+  if [[ -z "$editor" ]]; then
+    if have_cmd nano; then editor="nano"
+    elif have_cmd vi; then editor="vi"
+    else die "no editor found; set EDITOR"
+    fi
+  fi
+
+  if [[ "$yes" != "yes" ]]; then
+    echo "Editing $cfg" >&2
+  fi
+  "$editor" "$cfg"
+  chmod 600 "$cfg" || true
+
+  if [[ "$yes" != "yes" ]]; then
+    echo "Editing $auth" >&2
+  fi
+  "$editor" "$auth"
+  chmod 600 "$auth" || true
+
+  if [[ "$(read_current_profile)" == "$name" ]]; then
+    do_use "$name"
+  fi
+
+  echo "OK: edited profile '$name'"
+}
+
+do_use() {
+  local name="$1"
+  validate_profile_name "$name"
+  ensure_dirs
+  require_profile_exists "$name"
+
+  # Keep profiles clean: if model_provider != right, don't keep a stale [model_providers.right] block.
+  normalize_right_provider_table "$(profile_path "$name")/config.toml"
+
+  if profile_is_active "$name" 2>/dev/null; then
+    write_current_profile "$name"
+    normalize_right_provider_table "$(codex_home)/config.toml"
+    echo "OK: already using '$name'"
+    exit 0
+  fi
+
+  local ch pdir
+  ch="$(codex_home)"
+  pdir="$(profile_path "$name")"
+  mkdir -p "$ch"
+
+  backup_current "before-$name"
+  copy_atomic "$pdir/config.toml" "$ch/config.toml" 600
+  copy_atomic "$pdir/auth.json" "$ch/auth.json" 600
+  normalize_right_provider_table "$ch/config.toml"
+  write_current_profile "$name"
+
+  echo "OK: switched to '$name' (backed up previous to $(cat "$(state_dir)/last_backup"))"
+}
+
+do_rollback() {
+  ensure_dirs
+  local f bdir ch
+  f="$(state_dir)/last_backup"
+  [[ -r "$f" ]] || die "no last backup found (nothing to rollback)"
+  bdir="$(tr -d '\n' <"$f")"
+  [[ -d "$bdir" ]] || die "backup dir missing: $bdir"
+  [[ -f "$bdir/config.toml" ]] || die "backup missing config.toml: $bdir"
+  [[ -f "$bdir/auth.json" ]] || die "backup missing auth.json: $bdir"
+
+  ch="$(codex_home)"
+  mkdir -p "$ch"
+  copy_atomic "$bdir/config.toml" "$ch/config.toml" 600
+  copy_atomic "$bdir/auth.json" "$ch/auth.json" 600
+  printf "%s\n" "" >"$(current_profile_file)"
+  echo "OK: rolled back from $bdir"
+}
+
+main() {
+  require_cmd awk
+  require_cmd cat
+  require_cmd cp
+  require_cmd find
+  require_cmd sort
+  require_cmd rm
+  require_cmd mv
+  require_cmd mkdir
+  require_cmd mktemp
+  require_cmd chmod
+  require_cmd date
+  require_cmd sed
+
+  local cmd="${1:-}"
+  case "$cmd" in
+    ""|-h|--help|help)
+      usage
+      ;;
+    init)
+      with_lock do_init
+      ;;
+    list)
+      do_list
+      ;;
+    current)
+      do_current
+      ;;
+    path)
+      do_path
+      ;;
+    save)
+      [[ $# -eq 2 ]] || die "usage: $PROG save <profile>"
+      with_lock do_save "$2"
+      ;;
+    add)
+      [[ $# -ge 2 ]] || die "usage: $PROG add <profile> [options]"
+      shift
+      with_lock do_add "$@"
+      ;;
+    del)
+      [[ $# -ge 2 ]] || die "usage: $PROG del <profile>"
+      shift
+      with_lock do_del "$@"
+      ;;
+    edit)
+      [[ $# -ge 2 ]] || die "usage: $PROG edit <profile>"
+      shift
+      with_lock do_edit "$@"
+      ;;
+    use)
+      [[ $# -eq 2 ]] || die "usage: $PROG use <profile>"
+      with_lock do_use "$2"
+      ;;
+    rollback)
+      with_lock do_rollback
+      ;;
+    *)
+      die "unknown command: $cmd (run '$PROG --help')"
+      ;;
+  esac
+}
+
+main "$@"
