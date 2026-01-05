@@ -42,18 +42,18 @@ Simple profile switcher for OpenAI Codex CLI (`~/.codex/config.toml` + `~/.codex
 codex-switch init
 
 # 把当前 ~/.codex/config.toml + ~/.codex/auth.json 存成一个 profile
-codex-switch save right
+codex-switch save <xxx>
 
 # 切换到某个 profile（原子替换 + 自动备份）
-codex-switch use right
+codex-switch use <xxx>
 
-cx-save right
-cx-use right
-cx-add rightcode          # 交互式创建（会问 base_url；auth 直接输入 API key，回车则复制当前 auth.json）
-cx-add rightcode --auth-edit  # 交互创建后用编辑器设置 auth.json
-cx-del rightcode          # 删除 profile（会二次确认）
-cx-del rightcode -y       # 直接删除（无确认）
-cx-edit rightcode         # 编辑 profile 的 config/auth（用 $EDITOR）
+cx-save <xxx>
+cx-use <xxx>
+cx-add <xxx>          # 交互式创建（会问 base_url；auth 直接输入 API key，回车则复制当前 auth.json）
+cx-add <xxx> --auth-edit  # 交互创建后用编辑器设置 auth.json
+cx-del <xxx>          # 删除 profile（会二次确认）
+cx-del <xxx> -y       # 直接删除（无确认）
+cx-edit <xxx>         # 编辑 profile 的 config/auth（用 $EDITOR）
 
 codex-switch list
 codex-switch current

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.2 (2026-01-05)
+
+- Improve interactive prompts on some terminals (readline + bracketed-paste stripping)
+- README examples now use `<xxx>` placeholders (no local profile names)
+
 ## 0.1.1 (2026-01-05)
 
 - Install is now resilient to moving the repo (copies to `~/.local/share/codex-switch`)
