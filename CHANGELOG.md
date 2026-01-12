@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 (2026-01-12)
+
+- Default `use` behavior is now patch-mode: keeps a single `config.toml` and only patches `model_provider` + provider `base_url` (preserves other config like `mcp_servers` and helps share history across profiles)
+- Add `cx-list` shortcut to list saved profiles
+- Add `CODEX_SWITCH_USE_MODE=copy` to opt back into legacy full `config.toml` replacement
+
 ## 0.1.3 (2026-01-05)
 
 - Fix missing prompts on some terminals by writing prompts to a TTY (stderr or stdout)

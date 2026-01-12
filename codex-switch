@@ -26,6 +26,13 @@ term_printf() {
 
 # (no /dev/tty dependency; prompts use stderr/stdout and input is sanitized)
 
+use_mode() {
+  # Modes:
+  # - patch (default): update base_url + model_provider inside CODEX_HOME/config.toml, keep other settings (e.g. mcp_servers) intact.
+  # - copy: legacy behavior, overwrite CODEX_HOME/config.toml with profile config.toml.
+  echo "${CODEX_SWITCH_USE_MODE:-patch}"
+}
+
 usage() {
   cat <<'EOF'
 codex-switch - switch Codex multi-account configs (config.toml + auth.json)
@@ -39,6 +46,7 @@ Usage:
   codex-switch del <profile>
   codex-switch use <profile>
   codex-switch save <profile>
+  codex-switch unify-provider <provider>
   codex-switch rollback
   codex-switch path
 
@@ -46,6 +54,59 @@ Notes:
   - Profiles only include: config.toml + auth.json
   - Default CODEX_HOME: ~/.codex (override by exporting CODEX_HOME)
   - No secret contents are printed; files are treated as opaque blobs.
+  - Default switch behavior (CODEX_SWITCH_USE_MODE=patch):
+    - Keeps a single CODEX_HOME/config.toml and only patches base_url + model_provider.
+    - This preserves other config (e.g. mcp_servers) and helps share history across profiles when provider name is stable.
+
+Environment:
+  - CODEX_SWITCH_SHARED_PROVIDER: default provider name used by 'add' when --provider is omitted.
+    Use the same provider name across profiles to encourage shared session/history grouping in Codex.
+  - CODEX_SWITCH_USE_MODE: "patch" (default) or "copy" (legacy).
+EOF
+}
+
+usage_add() {
+  cat <<'EOF'
+Usage:
+  codex-switch add <profile> [options]
+
+Options:
+  --provider <name>     Provider name used in config.toml (default: <profile> or $CODEX_SWITCH_SHARED_PROVIDER)
+  --base-url <url>      base_url for the provider (prompt if missing)
+  --auth-copy           Copy current auth.json into profile
+  --auth-from <path>    Copy auth.json from another file
+  --auth-paste          Paste raw auth.json from stdin (finish with Ctrl-D)
+  --auth-edit           Create then open $EDITOR to edit auth.json
+  --auth-empty          Create empty auth.json ("{}")
+  --copy-auth           Alias of --auth-copy
+  --no-copy-auth        Alias of --auth-empty
+  --switch              Switch to the new profile after creating it
+  --force               Overwrite existing profile directory if exists
+  -y, --yes             Accept defaults for prompts
+
+Interactive defaults (no --auth-* given):
+  - Prompts for provider + base_url
+  - Prompts for API key as "auth:" (input hidden). Press Enter to copy current auth.json instead.
+
+Tip (shared history):
+  - Use the same provider name across all profiles (e.g. export CODEX_SWITCH_SHARED_PROVIDER=shared),
+    so Codex can group/show sessions consistently across profile switches.
+EOF
+}
+
+usage_unify_provider() {
+  cat <<'EOF'
+Usage:
+  codex-switch unify-provider <provider> [-y|--yes]
+
+What it does:
+  - Rewrites each profile's config.toml so model_provider=<provider>
+  - Preserves each profile's base_url by copying from the profile's current provider block
+  - Creates a backup of all profile config.toml files under ~/.codex-switch/backups/
+
+Why:
+  - Using a shared provider name across profiles helps Codex show history/sessions consistently
+    when switching auth/base_url per profile.
 EOF
 }
 
@@ -133,6 +194,19 @@ toml_get_string() {
   ' "$file" 2>/dev/null || true
 }
 
+toml_get_provider_base_url() {
+  local file="$1"
+  local provider="$2"
+  [[ -n "$provider" ]] || return 0
+
+  awk -v p="$provider" '
+    BEGIN { inside=0 }
+    $0=="[model_providers." p "]" { inside=1; next }
+    inside && /^\[/ { exit }
+    inside && /^base_url[ \t]*=/ { print; exit }
+  ' "$file" 2>/dev/null | sed -n 's/^base_url[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 || true
+}
+
 codex_native_bin() {
   if [[ -n "${CODEX_SWITCH_CODEX_BIN:-}" ]]; then
     echo "$CODEX_SWITCH_CODEX_BIN"
@@ -190,12 +264,37 @@ current_base_url() {
   mp="$(toml_get_string "$cfg" "model_provider")"
   [[ -n "$mp" ]] || return 0
 
-  awk -v mp="$mp" '
-    BEGIN { inside=0 }
-    $0=="[model_providers." mp "]" { inside=1; next }
-    inside && /^\[/ { exit }
-    inside && /^base_url[ \t]*=/ { print; exit }
-  ' "$cfg" 2>/dev/null | sed -n 's/^base_url[[:space:]]*=[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p' | head -n 1 || true
+  toml_get_provider_base_url "$cfg" "$mp"
+}
+
+shared_provider_name() {
+  if [[ -n "${CODEX_SWITCH_SHARED_PROVIDER:-}" ]]; then
+    echo "$CODEX_SWITCH_SHARED_PROVIDER"
+    return 0
+  fi
+
+  local cfg mp
+  cfg="$(codex_home)/config.toml"
+  if [[ -f "$cfg" ]]; then
+    mp="$(toml_get_string "$cfg" "model_provider")"
+    if [[ -n "$mp" ]]; then
+      echo "$mp"
+      return 0
+    fi
+  fi
+
+  echo "shared"
+}
+
+profile_base_url() {
+  local profile_cfg="$1"
+  [[ -f "$profile_cfg" ]] || die "missing profile config: $profile_cfg"
+  local mp url
+  mp="$(toml_get_string "$profile_cfg" "model_provider")"
+  [[ -n "$mp" ]] || die "missing model_provider in profile config: $profile_cfg"
+  url="$(toml_get_provider_base_url "$profile_cfg" "$mp")"
+  [[ -n "$url" ]] || die "missing base_url for provider '$mp' in profile config: $profile_cfg"
+  echo "$url"
 }
 
 sha256_file() {
@@ -348,7 +447,23 @@ profile_is_active() {
   pdir="$(profile_path "$name")"
   [[ -f "$ch/config.toml" && -f "$ch/auth.json" ]] || return 1
   [[ -f "$pdir/config.toml" && -f "$pdir/auth.json" ]] || return 1
-  [[ "$(fingerprint_dir "$ch")" == "$(fingerprint_dir "$pdir")" ]]
+
+  if [[ "$(use_mode)" == "copy" ]]; then
+    [[ "$(fingerprint_dir "$ch")" == "$(fingerprint_dir "$pdir")" ]]
+    return $?
+  fi
+
+  # patch mode: match auth.json + (shared provider base_url)
+  if [[ "$(sha256_file "$ch/auth.json")" != "$(sha256_file "$pdir/auth.json")" ]]; then
+    return 1
+  fi
+
+  local provider cur_url prof_url
+  provider="$(shared_provider_name)"
+  cur_url="$(toml_get_provider_base_url "$ch/config.toml" "$provider")"
+  [[ -n "$cur_url" ]] || return 1
+  prof_url="$(profile_base_url "$pdir/config.toml")"
+  [[ "$cur_url" == "$prof_url" ]]
 }
 
 write_file_atomic() {
@@ -540,6 +655,27 @@ backup_current() {
   prune_backups
 }
 
+backup_profile_configs() {
+  local label="$1"
+  local root ts bdir
+  root="$(backups_dir)"
+  ts="$(date +%Y%m%d-%H%M%S)"
+  bdir="$root/$ts-$label"
+  mkdir -p "$bdir"
+
+  local p name cfg
+  for p in "$(profiles_dir)"/*; do
+    [[ -d "$p" ]] || continue
+    name="$(basename "$p")"
+    cfg="$p/config.toml"
+    [[ -f "$cfg" ]] || continue
+    mkdir -p "$bdir/$name"
+    copy_atomic "$cfg" "$bdir/$name/config.toml" 600
+  done
+
+  echo "$bdir"
+}
+
 do_init() {
   ensure_dirs
   echo "OK: initialized at $(switch_root)"
@@ -653,28 +789,7 @@ do_add() {
         yes="yes"; shift
         ;;
       -h|--help)
-        cat <<'EOF'
-Usage:
-  codex-switch add <profile> [options]
-
-Options:
-  --provider <name>     Provider name used in config.toml (default: <profile>)
-  --base-url <url>      base_url for the provider (prompt if missing)
-  --auth-copy           Copy current auth.json into profile
-  --auth-from <path>    Copy auth.json from another file
-  --auth-paste          Paste raw auth.json from stdin (finish with Ctrl-D)
-  --auth-edit           Create then open $EDITOR to edit auth.json
-  --auth-empty          Create empty auth.json ("{}")
-  --copy-auth           Alias of --auth-copy
-  --no-copy-auth        Alias of --auth-empty
-  --switch              Switch to the new profile after creating it
-  --force               Overwrite existing profile directory if exists
-  -y, --yes             Accept defaults for prompts
-
-Interactive defaults (no --auth-* given):
-  - Prompts for provider + base_url
-  - Prompts for API key as "auth:" (input hidden). Press Enter to copy current auth.json instead.
-EOF
+        usage_add
         exit 0
         ;;
       *)
@@ -706,7 +821,11 @@ EOF
   old_provider="$(toml_get_string "$wdir/config.toml" "model_provider")"
 
   local default_provider default_base_url input
-  default_provider="$name"
+  if [[ "$(use_mode)" == "patch" ]]; then
+    default_provider="$(shared_provider_name)"
+  else
+    default_provider="${CODEX_SWITCH_SHARED_PROVIDER:-$name}"
+  fi
   if [[ -z "$provider" ]]; then
     if [[ "$yes" == "yes" ]]; then
       provider="$default_provider"
@@ -956,12 +1075,101 @@ do_use() {
   mkdir -p "$ch"
 
   backup_current "before-$name"
-  copy_atomic "$pdir/config.toml" "$ch/config.toml" 600
+
+  if [[ "$(use_mode)" == "copy" ]]; then
+    copy_atomic "$pdir/config.toml" "$ch/config.toml" 600
+    copy_atomic "$pdir/auth.json" "$ch/auth.json" 600
+    normalize_right_provider_table "$ch/config.toml"
+    write_current_profile "$name"
+    echo "OK: switched to '$name' (backed up previous to $(cat "$(state_dir)/last_backup"))"
+    return 0
+  fi
+
+  # patch mode: keep a single config.toml and only patch provider base_url + model_provider.
+  require_codex_files_exist
+
+  local provider base_url
+  provider="$(shared_provider_name)"
+  base_url="$(profile_base_url "$pdir/config.toml")"
+
+  ensure_provider_block "$ch/config.toml" "$provider" "$base_url"
+  set_toml_key "$ch/config.toml" "model_provider" "$provider"
   copy_atomic "$pdir/auth.json" "$ch/auth.json" 600
   normalize_right_provider_table "$ch/config.toml"
   write_current_profile "$name"
 
-  echo "OK: switched to '$name' (backed up previous to $(cat "$(state_dir)/last_backup"))"
+  echo "OK: switched to '$name' (patched provider='$provider', backed up previous to $(cat "$(state_dir)/last_backup"))"
+}
+
+do_unify_provider() {
+  local provider="$1"
+  shift || true
+  provider="$(trim_ws "$provider")"
+  if [[ -z "$provider" || "$provider" == "-h" || "$provider" == "--help" ]]; then
+    usage_unify_provider
+    exit 0
+  fi
+  [[ "$provider" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid provider name: $provider (allowed: [A-Za-z0-9_-]+)"
+
+  local yes="no"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes)
+        yes="yes"; shift
+        ;;
+      -h|--help)
+        usage_unify_provider
+        exit 0
+        ;;
+      *)
+        die "unknown option for unify-provider: $1"
+        ;;
+    esac
+  done
+
+  ensure_dirs
+  local backup_dir
+  backup_dir="$(backup_profile_configs "before-unify-provider-$provider")"
+  if [[ "$yes" != "yes" ]]; then
+    echo "Backup created at: $backup_dir" >&2
+    echo "This will rewrite model_provider in all profiles to '$provider'." >&2
+    local ans
+    ans="$(prompt "Continue? Type 'yes' to confirm" "")"
+    [[ "$ans" == "yes" ]] || die "aborted"
+  fi
+
+  local changed=0 skipped=0
+  local p name cfg mp base_url
+  for p in "$(profiles_dir)"/*; do
+    [[ -d "$p" ]] || continue
+    name="$(basename "$p")"
+    cfg="$p/config.toml"
+    if [[ ! -f "$cfg" ]]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    mp="$(toml_get_string "$cfg" "model_provider")"
+    if [[ -z "$mp" ]]; then
+      echo "WARN: $name: missing model_provider in $cfg (skipped)" >&2
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    base_url="$(toml_get_provider_base_url "$cfg" "$mp")"
+    if [[ -z "$base_url" ]]; then
+      echo "WARN: $name: missing base_url for provider '$mp' in $cfg (skipped)" >&2
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    ensure_provider_block "$cfg" "$provider" "$base_url"
+    set_toml_key "$cfg" "model_provider" "$provider"
+    changed=$((changed + 1))
+  done
+
+  echo "OK: unified provider to '$provider' (changed: $changed, skipped: $skipped)"
+  echo "Tip: run 'codex resume --all' to see all sessions (disables cwd filtering)."
 }
 
 do_rollback() {
@@ -1018,6 +1226,10 @@ main() {
       with_lock do_save "$2"
       ;;
     add)
+      if [[ $# -eq 2 && ( "$2" == "-h" || "$2" == "--help" ) ]]; then
+        usage_add
+        exit 0
+      fi
       [[ $# -ge 2 ]] || die "usage: $PROG add <profile> [options]"
       shift
       with_lock do_add "$@"
@@ -1035,6 +1247,11 @@ main() {
     use)
       [[ $# -eq 2 ]] || die "usage: $PROG use <profile>"
       with_lock do_use "$2"
+      ;;
+    unify-provider)
+      [[ $# -ge 2 ]] || die "usage: $PROG unify-provider <provider> [-y|--yes]"
+      shift
+      with_lock do_unify_provider "$@"
       ;;
     rollback)
       with_lock do_rollback
