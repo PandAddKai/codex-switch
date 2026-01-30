@@ -25,6 +25,7 @@ cp -a \
   "$ROOT_DIR/cx-use" \
   "$ROOT_DIR/cx-save" \
   "$ROOT_DIR/cx-list" \
+  "$ROOT_DIR/cx-current" \
   "$ROOT_DIR/cx-del" \
   "$ROOT_DIR/cx-edit" \
   "$ROOT_DIR/install.sh" \
@@ -44,6 +45,7 @@ chmod +x \
   "$tmp/$name/cx-use" \
   "$tmp/$name/cx-save" \
   "$tmp/$name/cx-list" \
+  "$tmp/$name/cx-current" \
   "$tmp/$name/cx-del" \
   "$tmp/$name/cx-edit" \
   "$tmp/$name/install.sh" \

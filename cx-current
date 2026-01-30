@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<'EOF'
+Usage:
+  cx-current
+
+Shortcut for:
+  codex-switch current
+EOF
+  exit 0
+fi
+
+exec codex-switch current
+

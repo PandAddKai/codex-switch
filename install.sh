@@ -35,6 +35,7 @@ install_file cx-add
 install_file cx-use
 install_file cx-save
 install_file cx-list
+install_file cx-current
 install_file cx-del
 install_file cx-edit
 install_file release.sh
@@ -45,6 +46,7 @@ link_bin cx-add
 link_bin cx-use
 link_bin cx-save
 link_bin cx-list
+link_bin cx-current
 link_bin cx-del
 link_bin cx-edit
 
@@ -52,7 +54,7 @@ cat <<EOF
 OK: installed to $INSTALL_ROOT
 OK: installed symlinks into $PREFIX
 - codex-switch
-- cx-add cx-use cx-save cx-list cx-del cx-edit
+- cx-add cx-use cx-save cx-list cx-current cx-del cx-edit
 
 Make sure $PREFIX is in PATH.
 EOF

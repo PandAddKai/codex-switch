@@ -993,24 +993,34 @@ EOF
 
 do_edit() {
   local name="$1"
+  local old_name="$1"
   shift || true
   validate_profile_name "$name"
   ensure_dirs
   require_profile_exists "$name"
 
   local yes="no"
+  local rename="no"
+  local was_current="no"
+  if [[ "$(read_current_profile)" == "$name" ]]; then
+    was_current="yes"
+  fi
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --rename)
+        rename="yes"; shift
+        ;;
       -y|--yes)
         yes="yes"; shift
         ;;
       -h|--help)
         cat <<'EOF'
 Usage:
-  codex-switch edit <profile> [-y]
+  codex-switch edit <profile> [--rename] [-y]
 
 Notes:
   - Opens profile config.toml and auth.json in $EDITOR (or nano/vi fallback)
+  - With --rename, prompts for a new profile name and renames the profile directory first
   - If the profile is current, re-applies it to CODEX_HOME after edit
 EOF
         exit 0
@@ -1020,6 +1030,31 @@ EOF
         ;;
     esac
   done
+
+  if [[ "$rename" == "yes" ]]; then
+    local new_name
+    term_printf "%s" "New profile name: "
+    if [[ -t 0 ]]; then
+      if ! IFS= read -r -e new_name; then
+        IFS= read -r new_name || die "input aborted"
+      fi
+    else
+      IFS= read -r new_name || die "input aborted"
+    fi
+    new_name="$(sanitize_terminal_input "$new_name")"
+    validate_profile_name "$new_name"
+
+    local old_dir new_dir
+    old_dir="$(profile_path "$name")"
+    new_dir="$(profile_path "$new_name")"
+    [[ ! -e "$new_dir" ]] || die "profile already exists: $new_name"
+
+    mv -- "$old_dir" "$new_dir"
+    name="$new_name"
+    if [[ "$yes" != "yes" ]]; then
+      echo "OK: renamed profile '$old_name' -> '$name'" >&2
+    fi
+  fi
 
   local pdir cfg auth editor
   pdir="$(profile_path "$name")"
@@ -1046,7 +1081,7 @@ EOF
   "$editor" "$auth"
   chmod 600 "$auth" || true
 
-  if [[ "$(read_current_profile)" == "$name" ]]; then
+  if [[ "$was_current" == "yes" ]]; then
     do_use "$name"
   fi
 

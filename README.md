@@ -54,11 +54,13 @@ codex-switch use <xxx>
 cx-save <xxx>
 cx-use <xxx>
 cx-list               # 列出所有 profiles
+cx-current            # 显示当前 profile
 cx-add <xxx>          # 交互式创建（会问 base_url；auth 直接输入 API key，回车则复制当前 auth.json）
 cx-add <xxx> --auth-edit  # 交互创建后用编辑器设置 auth.json
 cx-del <xxx>          # 删除 profile（会二次确认）
 cx-del <xxx> -y       # 直接删除（无确认）
 cx-edit <xxx>         # 编辑 profile 的 config/auth（用 $EDITOR）
+cx-edit <old> --rename  # 交互式重命名 profile
 
 codex-switch list
 codex-switch current

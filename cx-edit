@@ -4,13 +4,16 @@ set -euo pipefail
 if [[ "${1:-}" == "" || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   cat <<'EOF'
 Usage:
-  cx-edit <profile>
+  cx-edit <profile> [--rename] [-y]
 
 Shortcut for:
   codex-switch edit <profile>
+
+Options:
+  --rename   Prompt for a new profile name and rename the profile directory
+  -y         Less output (useful for scripts/tests)
 EOF
   exit 0
 fi
 
 exec codex-switch edit "$@"
-

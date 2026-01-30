@@ -10,6 +10,7 @@ rm -f \
   "$PREFIX/cx-use" \
   "$PREFIX/cx-save" \
   "$PREFIX/cx-list" \
+  "$PREFIX/cx-current" \
   "$PREFIX/cx-del" \
   "$PREFIX/cx-edit"
 
